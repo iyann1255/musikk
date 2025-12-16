@@ -1,7 +1,5 @@
 import asyncio
 import re
-import inspect
-import importlib
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -13,11 +11,13 @@ from pyrogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
+from pyrogram.enums import ChatType
 
 from pytgcalls import PyTgCalls
 from pytgcalls.types.input_stream import AudioPiped
 from pytgcalls.exceptions import NoActiveGroupCall
 
+from yt_dlp import YoutubeDL
 
 import config
 
@@ -28,9 +28,9 @@ if not (config.API_ID and config.API_HASH and config.BOT_TOKEN and config.ASSIST
     raise SystemExit("ENV wajib: API_ID, API_HASH, BOT_TOKEN, ASSISTANT_SESSION")
 
 # =========================
-# Regex & Classifier
+# Regex & classifier
 # =========================
-YT_RE = re.compile(r"(youtube\.com/watch\?v=|youtu\.be/|music\.youtube\.com/)", re.I)
+YT_RE = re.compile(r"(youtube\.com/watch\?v=|youtu\.be/|music\.youtube\.com/|youtube\.com/shorts/)", re.I)
 STREAM_EXTS = (".m3u8", ".mp3", ".aac", ".m4a", ".ogg", ".opus", ".flac", ".wav")
 
 
@@ -52,87 +52,12 @@ def is_youtube(s: str) -> bool:
 
 
 # =========================
-# Stream builder for py-tgcalls 2.2.8
-# =========================
-def make_stream(source: str):
-    """
-    py-tgcalls 2.2.8 punya modul pytgcalls.types.stream berisi class stream.
-    Nama class beda-beda antar rilis, jadi kita scan semua class dan coba instantiate.
-    """
-    mod = importlib.import_module("pytgcalls.types.stream")
-
-    classes = []
-    for name, obj in vars(mod).items():
-        if inspect.isclass(obj) and obj.__module__ == mod.__name__:
-            classes.append((name, obj))
-
-    # Prioritaskan nama yang biasanya stream audio
-    def score(n: str) -> int:
-        nlow = n.lower()
-        s = 0
-        if "audio" in nlow:
-            s += 10
-        if "stream" in nlow:
-            s += 6
-        if "piped" in nlow:
-            s += 4
-        if "input" in nlow:
-            s += 2
-        return -s  # sort ascending
-
-    classes.sort(key=lambda x: score(x[0]))
-
-    # Coba beberapa pola constructor yang umum
-    ctor_attempts = [
-        lambda cls: cls(source),
-        lambda cls: cls(input=source),
-        lambda cls: cls(path=source),
-        lambda cls: cls(url=source),
-        lambda cls: cls(source=source),
-    ]
-
-    last_err = None
-    for name, cls in classes:
-        for attempt in ctor_attempts:
-            try:
-                return attempt(cls)
-            except Exception as e:
-                last_err = e
-                continue
-
-    available = [n for n, _ in classes]
-    raise RuntimeError(
-        "Gagal bikin stream object untuk py-tgcalls 2.2.8.\n"
-        f"Available classes in pytgcalls.types.stream: {available}\n"
-        f"Last error: {last_err}"
-    )
-
-
-async def join_call(chat_id: int, stream_obj):
-    """
-    Beberapa build menerima (chat_id, stream) atau (chat_id, stream=...)
-    Kita handle dua-duanya.
-    """
-    try:
-        return await call.join_group_call(chat_id, stream=stream_obj)
-    except TypeError:
-        return await call.join_group_call(chat_id, stream_obj)
-
-
-async def change_call(chat_id: int, stream_obj):
-    try:
-        return await call.change_stream(chat_id, stream=stream_obj)
-    except TypeError:
-        return await call.change_stream(chat_id, stream_obj)
-
-
-# =========================
 # State
 # =========================
 @dataclass
 class Track:
     title: str
-    source: str
+    source: str  # direct playable url (m3u8/mp3/…)
     requester: str
 
 
@@ -165,7 +90,7 @@ assistant = Client(
 call = PyTgCalls(assistant)
 
 # =========================
-# YouTube Search via Data API
+# YouTube Search via Data API (no robots.txt)
 # =========================
 YTS_ENDPOINT = "https://www.googleapis.com/youtube/v3/search"
 
@@ -194,6 +119,33 @@ async def yt_search(query: str, limit: int = 5) -> List[Tuple[str, str]]:
         if vid:
             out.append((title, f"https://www.youtube.com/watch?v={vid}"))
     return out
+
+
+# =========================
+# YouTube -> direct audio url (yt-dlp)
+# =========================
+YDL_OPTS = {
+    "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,
+    "geo_bypass": True,
+    "format": "bestaudio/best",
+    # Important: kita butuh URL stream, bukan download file
+    "skip_download": True,
+}
+
+
+def ytdlp_extract_audio_url(url: str) -> Tuple[str, str]:
+    """
+    Return (title, direct_url) for playback with FFmpeg.
+    """
+    with YoutubeDL(YDL_OPTS) as ydl:
+        info = ydl.extract_info(url, download=False)
+    title = info.get("title") or "YouTube Audio"
+    direct = info.get("url")
+    if not direct:
+        raise RuntimeError("yt-dlp gagal ambil direct audio url.")
+    return title, direct
 
 
 # =========================
@@ -237,9 +189,7 @@ async def ensure_join_and_play(chat_id: int, announce_chat_id: int):
     s.paused = False
 
     try:
-        stream_obj = make_stream(nxt.source)
-        await join_call(chat_id, stream_obj)
-
+        await call.join_group_call(chat_id, AudioPiped(nxt.source))
         await bot.send_message(
             announce_chat_id,
             f"🎶 Now playing:\n**{nxt.title}**\nRequested by: {nxt.requester}",
@@ -269,9 +219,7 @@ async def play_next(chat_id: int, announce_chat_id: int):
     nxt = s.queue.pop(0)
     s.playing = nxt
 
-    stream_obj = make_stream(nxt.source)
-    await change_call(chat_id, stream_obj)
-
+    await call.change_stream(chat_id, AudioPiped(nxt.source))
     await bot.send_message(
         announce_chat_id,
         f"🎶 Now playing:\n**{nxt.title}**\nRequested by: {nxt.requester}",
@@ -323,28 +271,20 @@ def parse_c_command(m: Message) -> Tuple[Optional[str], str]:
 
 
 # =========================
-# Commands
+# Core handler
 # =========================
-@bot.on_message(filters.command(["start", "help"]))
-async def help_cmd(_, m: Message):
-    txt = (
-        "🎵 **MusicBot (versi kita)**\n\n"
-        "**Commands**\n"
-        "/play <m3u8/mp3/url|judul|link yt>\n"
-        "/cplay [@channel|-100id] <m3u8/mp3/url|judul|link yt>\n"
-        "/pause, /resume, /skip, /stop, /queue\n\n"
-        "Catatan: Untuk muter di voice chat, **VC harus aktif**."
-    )
-    await m.reply(txt)
-
-
 async def handle_play(m: Message, target_chat_id: int, query: str):
     requester = m.from_user.mention if m.from_user else "Unknown"
 
     if not query:
         return await m.reply("Format: `/play <judul|url>`", quote=True)
 
-    # 1) Stream URL -> real playback
+    # Only allow playback in groups/supergroups/channels context
+    # (Bot bisa reply di private tapi playback VC butuh chat target)
+    # We'll still allow /cplay from private if you want later.
+    # For now: keep simple.
+
+    # 1) Direct stream URL
     if is_stream_url(query):
         s = st(target_chat_id)
         s.queue.append(Track(title=query, source=query, requester=requester))
@@ -353,61 +293,84 @@ async def handle_play(m: Message, target_chat_id: int, query: str):
             await m.reply("✅ Stream masuk. Nyoba join VC...")
             return await ensure_join_and_play(target_chat_id, m.chat.id)
 
-        return await m.reply(f"✅ Masuk queue stream.\nPosisi: `{len(s.queue)}`", quote=True)
+        return await m.reply(f"✅ Masuk queue.\nPosisi: `{len(s.queue)}`", quote=True)
 
-    # 2) YouTube link/keyword -> metadata/search only (no scraping)
-    if is_youtube(query) or not is_url(query):
+    # 2) YouTube link -> extract audio direct URL -> playback
+    if is_youtube(query):
+        msg = await m.reply("🎧 Ambil audio YouTube (yt-dlp)...")
+        try:
+            title, direct = await asyncio.to_thread(ytdlp_extract_audio_url, query)
+        except Exception as e:
+            return await msg.edit(
+                "❌ Gagal ambil audio dari YouTube.\n"
+                f"`{e}`\n\n"
+                "Catatan: kadang YouTube berubah & yt-dlp perlu update."
+            )
+
+        s = st(target_chat_id)
+        s.queue.append(Track(title=title, source=direct, requester=requester))
+        if not s.playing:
+            await msg.edit("✅ Masuk. Nyoba join VC...")
+            return await ensure_join_and_play(target_chat_id, m.chat.id)
+
+        return await msg.edit(f"✅ Masuk queue: **{title}**\nPosisi: `{len(s.queue)}`")
+
+    # 3) Keyword -> search via YouTube Data API -> show list (dan opsional play)
+    if not is_url(query):
         if not config.YOUTUBE_API_KEY:
-            if is_youtube(query):
-                return await m.reply(
-                    "✅ Link YouTube siap dibuka.\n"
-                    "Untuk search hasil rapi via API, set `YOUTUBE_API_KEY`.\n"
-                    "Untuk playback VC: kirim link **m3u8/mp3 stream**.",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open YouTube", url=query)]]),
-                )
             q = query.replace(" ", "+")
             url = f"https://www.youtube.com/results?search_query={q}"
             return await m.reply(
-                "Saya bisa bantu cari via tombol ini (tanpa scraping).\n"
-                "Kalau mau hasil list rapi di bot, set `YOUTUBE_API_KEY`.\n"
-                "Untuk playback VC: pakai link **m3u8/mp3 stream**.",
+                "Saya bisa cariin via tombol ini.\n"
+                "Kalau mau hasil list rapi + bisa auto-play, set `YOUTUBE_API_KEY`.\n",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open Search", url=url)]]),
             )
 
         msg = await m.reply("🔎 Cari di YouTube (API resmi)...")
         try:
-            if is_youtube(query):
-                results = [("Open YouTube", query)]
-            else:
-                results = await yt_search(query, limit=5)
+            results = await yt_search(query, limit=5)
         except Exception as e:
             return await msg.edit(f"❌ Gagal search YouTube API.\n`{e}`")
 
         if not results:
-            return await msg.edit("❌ Tidak ada hasil (atau API key belum benar).")
+            return await msg.edit("❌ Tidak ada hasil.")
 
-        if is_youtube(query):
-            return await msg.edit(
-                "✅ Link YouTube siap dibuka.\nCatatan: untuk playback VC, gunakan link stream (m3u8/mp3).",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open", url=query)]]),
-            )
+        # Tampilkan list + tombol open (biar user bisa copy link /play link)
+        text = "✅ Hasil YouTube (pilih/open link):\n" + "\n".join(
+            [f"{i}. {t[0]}" for i, t in enumerate(results, 1)]
+        ) + "\n\nKirim linknya ke `/play <link>` buat langsung play."
+        return await msg.edit(text, reply_markup=yt_kb(results))
 
-        return await msg.edit(
-            "✅ Hasil YouTube (pilih):\n" + "\n".join([f"{i}. {t[0]}" for i, t in enumerate(results, 1)]),
-            reply_markup=yt_kb(results),
-        )
-
+    # 4) URL non-stream (misal website biasa)
     return await m.reply(
-        "URL itu bukan stream audio/video yang bisa diputar langsung.\n"
-        "Kirim link **m3u8/mp3/radio stream** kalau mau diputar di VC.",
+        "URL itu bukan stream yang bisa diputar langsung.\n"
+        "Untuk VC: kirim link **m3u8/mp3/radio stream**, atau link YouTube.",
         quote=True,
     )
 
 
+# =========================
+# Commands
+# =========================
+@bot.on_message(filters.command(["start", "help"]))
+async def help_cmd(_, m: Message):
+    txt = (
+        "🎵 **MusicBot (versi stabil)**\n\n"
+        "**Commands**\n"
+        "/play <m3u8/mp3/url|judul|link yt>\n"
+        "/cplay [@channel|-100id] <m3u8/mp3/url|judul|link yt>\n"
+        "/pause, /resume, /skip, /stop, /queue\n\n"
+        "Catatan:\n"
+        "- Playback VC butuh **VC aktif**.\n"
+        "- Keyword YouTube butuh `YOUTUBE_API_KEY`.\n"
+        "- Link YouTube bisa langsung `/play <link>`."
+    )
+    await m.reply(txt)
+
+
 @bot.on_message(filters.command(["play"]))
 async def play_cmd(_, m: Message):
-    if m.chat.id > 0:
-        return await m.reply("Pakai di grup/channel ya. Di private saya cuma bisa kasih link/search.")
+    # allow in groups/supergroups
     query = " ".join(m.command[1:]).strip() if m.command else ""
     await handle_play(m, m.chat.id, query)
 

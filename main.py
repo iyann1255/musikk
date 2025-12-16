@@ -13,7 +13,7 @@ from pyrogram.types import (
 )
 
 from pytgcalls import PyTgCalls
-from pytgcalls.types.input_stream import AudioPiped
+from pytgcalls.types import AudioPiped
 from pytgcalls.exceptions import NoActiveGroupCall
 
 import config

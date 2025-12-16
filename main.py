@@ -13,7 +13,6 @@ from pyrogram.types import (
 )
 
 from pytgcalls import PyTgCalls
-from pytgcalls.types import AudioPiped
 from pytgcalls.exceptions import NoActiveGroupCall
 
 import config
@@ -23,6 +22,39 @@ import config
 # =========================
 if not (config.API_ID and config.API_HASH and config.BOT_TOKEN and config.ASSISTANT_SESSION):
     raise SystemExit("ENV wajib: API_ID, API_HASH, BOT_TOKEN, ASSISTANT_SESSION")
+
+# =========================
+# Stream type auto-detect (py-tgcalls 2.x)
+# =========================
+def _resolve_stream_class():
+    """
+    py-tgcalls 2.x sudah beberapa kali ganti nama / lokasi kelas stream.
+    Fungsi ini mencari kelas stream yang tersedia untuk "stream URL / file path".
+    """
+    candidates = [
+        # candidate tuples: (module, class_name)
+        ("pytgcalls.types.stream", "StreamAudio"),          # beberapa build
+        ("pytgcalls.types.stream", "AudioStream"),          # beberapa build
+        ("pytgcalls.types.input_stream", "AudioPiped"),     # legacy (kalau ada)
+        ("pytgcalls.types.input_stream", "AudioStream"),    # legacy
+        ("pytgcalls.types.input_stream", "InputAudioStream"),  # kemungkinan lain
+    ]
+    last_err = None
+    for mod_name, cls_name in candidates:
+        try:
+            mod = __import__(mod_name, fromlist=[cls_name])
+            cls = getattr(mod, cls_name)
+            return cls
+        except Exception as e:
+            last_err = e
+            continue
+    raise ImportError(
+        "Tidak menemukan kelas stream yang kompatibel di py-tgcalls 2.x. "
+        "Coba jalankan: python -c \"import pkgutil,pytgcalls; print([m.name for m in pkgutil.iter_modules(pytgcalls.__path__)])\" "
+        f"(last_err={last_err})"
+    )
+
+StreamCls = _resolve_stream_class()
 
 # =========================
 # Regex & Classifier
@@ -93,10 +125,6 @@ YTS_ENDPOINT = "https://www.googleapis.com/youtube/v3/search"
 
 
 async def yt_search(query: str, limit: int = 5) -> List[Tuple[str, str]]:
-    """
-    Return: list of (title, url).
-    NOTE: Ini hanya search metadata via YouTube Data API v3 (resmi).
-    """
     if not config.YOUTUBE_API_KEY:
         return []
 
@@ -116,8 +144,7 @@ async def yt_search(query: str, limit: int = 5) -> List[Tuple[str, str]]:
     out: List[Tuple[str, str]] = []
     for it in data.get("items", []):
         vid = (it.get("id") or {}).get("videoId")
-        snip = it.get("snippet") or {}
-        title = snip.get("title") or "Unknown"
+        title = ((it.get("snippet") or {}).get("title")) or "Unknown"
         if vid:
             out.append((title, f"https://www.youtube.com/watch?v={vid}"))
     return out
@@ -152,8 +179,20 @@ def yt_kb(results: List[Tuple[str, str]]) -> InlineKeyboardMarkup:
 
 
 # =========================
-# Voice Playback
+# Voice Playback (py-tgcalls 2.x)
 # =========================
+def make_stream(source: str):
+    """
+    Buat objek stream dari URL/path.
+    StreamCls di-resolve otomatis.
+    """
+    try:
+        return StreamCls(source)
+    except TypeError:
+        # beberapa class butuh argumen keyword
+        return StreamCls(input=source)
+
+
 async def ensure_join_and_play(chat_id: int, announce_chat_id: int):
     s = st(chat_id)
     if s.playing or not s.queue:
@@ -164,9 +203,7 @@ async def ensure_join_and_play(chat_id: int, announce_chat_id: int):
     s.paused = False
 
     try:
-        # py-tgcalls 2.2.8: pass AudioPiped directly (no InputStream wrapper)
-        await call.join_group_call(chat_id, stream=AudioPiped(nxt.source))
-
+        await call.join_group_call(chat_id, make_stream(nxt.source))
         await bot.send_message(
             announce_chat_id,
             f"🎶 Now playing:\n**{nxt.title}**\nRequested by: {nxt.requester}",
@@ -196,7 +233,7 @@ async def play_next(chat_id: int, announce_chat_id: int):
     nxt = s.queue.pop(0)
     s.playing = nxt
 
-    await call.change_stream(chat_id, stream=AudioPiped(nxt.source))
+    await call.change_stream(chat_id, make_stream(nxt.source))
     await bot.send_message(
         announce_chat_id,
         f"🎶 Now playing:\n**{nxt.title}**\nRequested by: {nxt.requester}",
@@ -282,7 +319,6 @@ async def handle_play(m: Message, target_chat_id: int, query: str):
 
     # 2) YouTube link/keyword -> metadata/search only (no scraping)
     if is_youtube(query) or not is_url(query):
-        # No API key -> fallback to open search link
         if not config.YOUTUBE_API_KEY:
             if is_youtube(query):
                 return await m.reply(
@@ -318,7 +354,6 @@ async def handle_play(m: Message, target_chat_id: int, query: str):
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open", url=query)]]),
             )
 
-        # tampilkan daftar + tombol open
         return await msg.edit(
             "✅ Hasil YouTube (pilih):\n" + "\n".join([f"{i}. {t[0]}" for i, t in enumerate(results, 1)]),
             reply_markup=yt_kb(results),

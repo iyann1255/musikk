@@ -196,7 +196,7 @@ async def play_next(chat_id: int, announce_chat_id: int):
     nxt = s.queue.pop(0)
     s.playing = nxt
 
-    await call.change_stream(chat_id, AudioPiped(nxt.source))
+    await call.change_stream(chat_id, stream=AudioPiped(nxt.source))
     await bot.send_message(
         announce_chat_id,
         f"🎶 Now playing:\n**{nxt.title}**\nRequested by: {nxt.requester}",

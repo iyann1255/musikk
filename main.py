@@ -1,532 +1,362 @@
-import asyncio
+import os
 import re
+import asyncio
+import shutil
+import subprocess
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-import aiohttp
 from pyrogram import Client, filters
-from pyrogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
-from pyrogram.enums import ChatType
+from pyrogram.types import Message
 
 from pytgcalls import PyTgCalls
 from pytgcalls.types.input_stream import AudioPiped
-from pytgcalls.exceptions import NoActiveGroupCall
-
-from yt_dlp import YoutubeDL
-
-import config
+from pytgcalls.exceptions import AlreadyJoinedError, NoActiveGroupCall, NotInGroupCallError
 
 # =========================
-# Guards
+# ENV (WAJIB)
 # =========================
-if not (config.API_ID and config.API_HASH and config.BOT_TOKEN and config.ASSISTANT_SESSION):
-    raise SystemExit("ENV wajib: API_ID, API_HASH, BOT_TOKEN, ASSISTANT_SESSION")
+API_ID = int(os.getenv("API_ID", "29655477"))
+API_HASH = os.getenv("API_HASH", "2de42d28d36e637c54d5571df5679b7d").strip()
 
-# =========================
-# Regex & classifier
-# =========================
-YT_RE = re.compile(r"(youtube\.com/watch\?v=|youtu\.be/|music\.youtube\.com/|youtube\.com/shorts/)", re.I)
-STREAM_EXTS = (".m3u8", ".mp3", ".aac", ".m4a", ".ogg", ".opus", ".flac", ".wav")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7714224903:AAEI8X6z_A34C5mDlOQcCaTXBkKnp5Q0uTs").strip()
 
+# Assistant account (user account) pakai string session
+ASSISTANT_SESSION = os.getenv("ASSISTANT_SESSION", "BQF-4awAOJEHp5bqDsdHGatIW-x-EGmq6moHeaE0QHyVHSWqP2z1TyoL_BvWbKTS4egfzBKbH3wbG9gOhWR350_OodFk5Ya5p1wFxBFjyTr2vPo547zazMa-Z1-Y9r0B-CkGG4iIBDME8GAYXZ0OHOaVv1HyTJ8gNJt3eUo2OQapEckXLmN9t2pIvZh2Af8IeZAts0vvpn2RJkmS93dokPFoGUKJ9LyHQ7E6fbrdGvq7TA-OFt45S-E5uk7coZE-fOVM3q-rK6S838QRXzjq_tKrcyyaRRmYD1xt98KZSb8YxyAapP2OlmQOaga2wvVyqmwRsWpaPSUycbBp85OWQqfOpWQwWwAAAAHn-8vxAA").strip()
 
-def is_url(s: str) -> bool:
-    s = (s or "").strip().lower()
-    return s.startswith("http://") or s.startswith("https://")
+# Opsional: batasi siapa yang boleh kontrol
+# IS_OWNER_ONLY=1 dan OWNER_IDS="123,456"
+IS_OWNER_ONLY = os.getenv("IS_OWNER_ONLY", "5504473114").strip() == "1"
+OWNER_IDS = set()
+if os.getenv("OWNER_IDS"):
+    OWNER_IDS = {int(x.strip()) for x in os.getenv("OWNER_IDS", "5504473114").split(",") if x.strip().isdigit()}
 
+# Folder cache
+CACHE_DIR = os.getenv("CACHE_DIR", "cache").strip()
+os.makedirs(CACHE_DIR, exist_ok=True)
 
-def is_stream_url(s: str) -> bool:
-    u = (s or "").strip().lower()
-    if not is_url(u):
-        return False
-    return any(ext in u for ext in STREAM_EXTS)
+YTDLP_BIN = shutil.which("yt-dlp") or "yt-dlp"
+FFMPEG_BIN = shutil.which("ffmpeg") or "ffmpeg"
 
-
-def is_youtube(s: str) -> bool:
-    t = (s or "").strip().lower()
-    return bool(YT_RE.search(t))
-
+YOUTUBE_URL_RE = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/", re.IGNORECASE)
 
 # =========================
-# State
+# Data structures
 # =========================
 @dataclass
 class Track:
     title: str
-    source: str  # direct playable url (m3u8/mp3/…)
-    requester: str
-
+    source: str  # URL / query
+    file_path: str
+    duration: Optional[int] = None
 
 @dataclass
-class ChatState:
+class ChatPlayer:
     queue: List[Track] = field(default_factory=list)
-    playing: Optional[Track] = None
-    paused: bool = False
+    now_playing: Optional[Track] = None
+    playing_task: Optional[asyncio.Task] = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-
-STATE: Dict[int, ChatState] = {}
-
-
-def st(chat_id: int) -> ChatState:
-    if chat_id not in STATE:
-        STATE[chat_id] = ChatState()
-    return STATE[chat_id]
-
+PLAYERS: Dict[int, ChatPlayer] = {}
 
 # =========================
 # Clients
 # =========================
-bot = Client("musicbot-bot", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.BOT_TOKEN)
-assistant = Client(
-    "musicbot-assistant",
-    api_id=config.API_ID,
-    api_hash=config.API_HASH,
-    session_string=config.ASSISTANT_SESSION,
-)
-call = PyTgCalls(assistant)
+if not API_ID or not API_HASH:
+    raise RuntimeError("API_ID/API_HASH belum di-set. Set ENV: API_ID, API_HASH.")
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN belum di-set. Set ENV: BOT_TOKEN.")
+
+if not ASSISTANT_SESSION:
+    raise RuntimeError("ASSISTANT_SESSION belum di-set. Wajib pakai assistant user session untuk VC streaming.")
+
+bot = Client("musicbot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+assistant = Client("assistant", api_id=API_ID, api_hash=API_HASH, session_string=ASSISTANT_SESSION)
+calls = PyTgCalls(assistant)
 
 # =========================
-# YouTube Search via Data API (no robots.txt)
+# Helpers
 # =========================
-YTS_ENDPOINT = "https://www.googleapis.com/youtube/v3/search"
+def is_allowed(m: Message) -> bool:
+    if not IS_OWNER_ONLY:
+        return True
+    u = m.from_user
+    return bool(u and u.id in OWNER_IDS)
 
+def ensure_tools():
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("ffmpeg tidak ditemukan di PATH. Install ffmpeg dulu.")
+    # yt-dlp bisa dari python package atau binary, kita pakai pemanggilan command saja.
+    # Kalau command gagal, error akan ditangkap.
 
-async def yt_search(query: str, limit: int = 5) -> List[Tuple[str, str]]:
-    if not config.YOUTUBE_API_KEY:
-        return []
+def get_player(chat_id: int) -> ChatPlayer:
+    if chat_id not in PLAYERS:
+        PLAYERS[chat_id] = ChatPlayer()
+    return PLAYERS[chat_id]
 
-    params = {
-        "part": "snippet",
-        "q": query,
-        "type": "video",
-        "maxResults": max(1, min(limit, 10)),
-        "key": config.YOUTUBE_API_KEY,
-        "safeSearch": "none",
-    }
-
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as session:
-        async with session.get(YTS_ENDPOINT, params=params) as resp:
-            data = await resp.json()
-
-    out: List[Tuple[str, str]] = []
-    for it in data.get("items", []):
-        vid = (it.get("id") or {}).get("videoId")
-        title = ((it.get("snippet") or {}).get("title")) or "Unknown"
-        if vid:
-            out.append((title, f"https://www.youtube.com/watch?v={vid}"))
-    return out
-
-
-# =========================
-# YouTube -> direct audio url (yt-dlp)
-# =========================
-YDL_OPTS = {
-    "quiet": True,
-    "no_warnings": True,
-    "noplaylist": True,
-    "geo_bypass": True,
-    "format": "bestaudio/best",
-    # Important: kita butuh URL stream, bukan download file
-    "skip_download": True,
-}
-
-
-def ytdlp_extract_audio_url(url: str) -> Tuple[str, str]:
-    """
-    Return (title, direct_url) for playback with FFmpeg.
-    """
-    with YoutubeDL(YDL_OPTS) as ydl:
-        info = ydl.extract_info(url, download=False)
-    title = info.get("title") or "YouTube Audio"
-    direct = info.get("url")
-    if not direct:
-        raise RuntimeError("yt-dlp gagal ambil direct audio url.")
-    return title, direct
-
-
-# =========================
-# UI
-# =========================
-def player_kb(chat_id: int) -> InlineKeyboardMarkup:
-    s = st(chat_id)
-    pause_label = "▶️ Resume" if s.paused else "⏸ Pause"
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(pause_label, callback_data=f"pl:pause:{chat_id}"),
-                InlineKeyboardButton("⏭ Skip", callback_data=f"pl:skip:{chat_id}"),
-            ],
-            [
-                InlineKeyboardButton("⏹ Stop", callback_data=f"pl:stop:{chat_id}"),
-                InlineKeyboardButton("📜 Queue", callback_data=f"pl:queue:{chat_id}"),
-            ],
-        ]
+async def run_cmd(cmd: List[str]) -> Tuple[int, str, str]:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
+    out, err = await proc.communicate()
+    return proc.returncode, out.decode(errors="ignore"), err.decode(errors="ignore")
 
+async def ytdlp_download_audio(query_or_url: str, chat_id: int) -> Track:
+    """
+    Download bestaudio ke file .mp3 (via ffmpeg convert) supaya stream stabil.
+    """
+    # File unik per request
+    outtmpl = os.path.join(CACHE_DIR, f"{chat_id}_%(id)s.%(ext)s")
+    cmd = [
+        YTDLP_BIN,
+        "--no-warnings",
+        "--geo-bypass",
+        "-f", "bestaudio/best",
+        "--extract-audio",
+        "--audio-format", "mp3",
+        "--audio-quality", "0",
+        "--no-playlist",
+        "-o", outtmpl,
+        query_or_url if YOUTUBE_URL_RE.search(query_or_url) else f"ytsearch1:{query_or_url}",
+        "--print", "%(title)s",
+        "--print", "%(id)s",
+    ]
+    code, out, err = await run_cmd(cmd)
+    if code != 0:
+        raise RuntimeError(f"yt-dlp gagal (code={code}): {err.strip() or out.strip()}")
 
-def yt_kb(results: List[Tuple[str, str]]) -> InlineKeyboardMarkup:
-    rows = []
-    for i, (title, url) in enumerate(results[:5], start=1):
-        rows.append([InlineKeyboardButton(f"{i}. Open", url=url)])
-    rows.append([InlineKeyboardButton("Open YouTube", url="https://www.youtube.com")])
-    return InlineKeyboardMarkup(rows)
+    # Output print: title baris 1, id baris 2 (biasanya)
+    lines = [x.strip() for x in out.splitlines() if x.strip()]
+    if len(lines) < 2:
+        raise RuntimeError("yt-dlp output tidak sesuai (title/id tidak kebaca).")
 
+    title = lines[-2]
+    vid = lines[-1]
 
-# =========================
-# Voice Playback
-# =========================
-async def ensure_join_and_play(chat_id: int, announce_chat_id: int):
-    s = st(chat_id)
-    if s.playing or not s.queue:
-        return
+    # Setelah extract, hasilnya jadi .mp3 dengan template: {chat_id}_{id}.mp3
+    file_path = os.path.join(CACHE_DIR, f"{chat_id}_{vid}.mp3")
+    if not os.path.exists(file_path):
+        # Fallback: cari file yang matching
+        for fn in os.listdir(CACHE_DIR):
+            if fn.startswith(f"{chat_id}_{vid}.") and fn.endswith(".mp3"):
+                file_path = os.path.join(CACHE_DIR, fn)
+                break
 
-    nxt = s.queue.pop(0)
-    s.playing = nxt
-    s.paused = False
+    if not os.path.exists(file_path):
+        raise RuntimeError("File hasil download tidak ditemukan. Cek permission/storage.")
 
+    return Track(title=title, source=query_or_url, file_path=file_path)
+
+async def join_vc(chat_id: int):
     try:
-        await call.join_group_call(chat_id, AudioPiped(nxt.source))
-        await bot.send_message(
-            announce_chat_id,
-            f"🎶 Now playing:\n**{nxt.title}**\nRequested by: {nxt.requester}",
-            reply_markup=player_kb(chat_id),
-        )
+        await calls.join_group_call(chat_id, AudioPiped("silence.mp3"))
+    except AlreadyJoinedError:
+        return
     except NoActiveGroupCall:
-        s.playing = None
-        await bot.send_message(announce_chat_id, "❌ Voice chat belum aktif. Nyalain VC dulu, lalu /play lagi.")
+        raise RuntimeError("Belum ada voice chat yang aktif di grup ini. Nyalakan VC dulu.")
     except Exception as e:
-        s.playing = None
-        await bot.send_message(announce_chat_id, f"❌ Gagal join/play.\n`{e}`")
+        raise RuntimeError(f"Gagal join VC: {e}")
 
+async def change_stream(chat_id: int, file_path: str):
+    await calls.change_stream(chat_id, AudioPiped(file_path))
 
-async def play_next(chat_id: int, announce_chat_id: int):
-    s = st(chat_id)
-    s.paused = False
-
-    if not s.queue:
-        s.playing = None
-        try:
-            await call.leave_group_call(chat_id)
-        except Exception:
-            pass
-        await bot.send_message(announce_chat_id, "Queue habis. Keluar dari VC.")
+async def leave_vc(chat_id: int):
+    try:
+        await calls.leave_group_call(chat_id)
+    except (NotInGroupCallError,):
         return
 
-    nxt = s.queue.pop(0)
-    s.playing = nxt
+async def play_loop(chat_id: int):
+    player = get_player(chat_id)
+    async with player.lock:
+        if player.playing_task and not player.playing_task.done():
+            return  # sudah ada loop
 
-    await call.change_stream(chat_id, AudioPiped(nxt.source))
-    await bot.send_message(
-        announce_chat_id,
-        f"🎶 Now playing:\n**{nxt.title}**\nRequested by: {nxt.requester}",
-        reply_markup=player_kb(chat_id),
-    )
+        async def _runner():
+            while True:
+                async with player.lock:
+                    if not player.queue:
+                        player.now_playing = None
+                        break
+                    track = player.queue.pop(0)
+                    player.now_playing = track
 
+                # Join & stream
+                try:
+                    # Join dulu kalau belum join
+                    try:
+                        await calls.join_group_call(chat_id, AudioPiped(track.file_path))
+                    except AlreadyJoinedError:
+                        await change_stream(chat_id, track.file_path)
+                except NoActiveGroupCall:
+                    async with player.lock:
+                        player.queue.insert(0, track)
+                        player.now_playing = None
+                    break
+                except Exception:
+                    # skip track kalau rusak
+                    continue
 
-@call.on_stream_end()
-async def on_end(_, update):
-    chat_id = update.chat_id
-    s = st(chat_id)
-    if s.queue:
-        try:
-            await play_next(chat_id, chat_id)
-        except Exception:
-            pass
-    else:
-        s.playing = None
-        s.paused = False
-        try:
-            await call.leave_group_call(chat_id)
-        except Exception:
-            pass
+                # Tunggu track selesai: kita pakai durasi "kira-kira" dari ffprobe kalau ada,
+                # tapi supaya simpel & tahan banting, kita polling status:
+                # Kalau user skip/stop, now_playing akan berubah.
+                for _ in range(999999):
+                    await asyncio.sleep(1)
+                    async with player.lock:
+                        if player.now_playing != track:
+                            break
+                        # kalau queue kosong & tetap track yang sama, lanjut tunggu
+                # lanjut loop
 
+            # kalau selesai semua, keluar VC biar gak nangkring
+            await leave_vc(chat_id)
 
-# =========================
-# Target resolver for /cplay
-# =========================
-async def resolve_target_chat_id(m: Message, token: Optional[str]) -> int:
-    if not token:
-        return m.chat.id
-    t = token.strip()
-    if t.startswith("@"):
-        chat = await bot.get_chat(t)
-        return chat.id
-    return int(t)
-
-
-def parse_c_command(m: Message) -> Tuple[Optional[str], str]:
-    args = m.command[1:] if m.command else []
-    if not args:
-        return None, ""
-    first = args[0]
-    if first.startswith("@") or first.startswith("-100"):
-        target = first
-        query = " ".join(args[1:]).strip()
-        return target, query
-    return None, " ".join(args).strip()
-
-
-# =========================
-# Core handler
-# =========================
-async def handle_play(m: Message, target_chat_id: int, query: str):
-    requester = m.from_user.mention if m.from_user else "Unknown"
-
-    if not query:
-        return await m.reply("Format: `/play <judul|url>`", quote=True)
-
-    # Only allow playback in groups/supergroups/channels context
-    # (Bot bisa reply di private tapi playback VC butuh chat target)
-    # We'll still allow /cplay from private if you want later.
-    # For now: keep simple.
-
-    # 1) Direct stream URL
-    if is_stream_url(query):
-        s = st(target_chat_id)
-        s.queue.append(Track(title=query, source=query, requester=requester))
-
-        if not s.playing:
-            await m.reply("✅ Stream masuk. Nyoba join VC...")
-            return await ensure_join_and_play(target_chat_id, m.chat.id)
-
-        return await m.reply(f"✅ Masuk queue.\nPosisi: `{len(s.queue)}`", quote=True)
-
-    # 2) YouTube link -> extract audio direct URL -> playback
-    if is_youtube(query):
-        msg = await m.reply("🎧 Ambil audio YouTube (yt-dlp)...")
-        try:
-            title, direct = await asyncio.to_thread(ytdlp_extract_audio_url, query)
-        except Exception as e:
-            return await msg.edit(
-                "❌ Gagal ambil audio dari YouTube.\n"
-                f"`{e}`\n\n"
-                "Catatan: kadang YouTube berubah & yt-dlp perlu update."
-            )
-
-        s = st(target_chat_id)
-        s.queue.append(Track(title=title, source=direct, requester=requester))
-        if not s.playing:
-            await msg.edit("✅ Masuk. Nyoba join VC...")
-            return await ensure_join_and_play(target_chat_id, m.chat.id)
-
-        return await msg.edit(f"✅ Masuk queue: **{title}**\nPosisi: `{len(s.queue)}`")
-
-    # 3) Keyword -> search via YouTube Data API -> show list (dan opsional play)
-    if not is_url(query):
-        if not config.YOUTUBE_API_KEY:
-            q = query.replace(" ", "+")
-            url = f"https://www.youtube.com/results?search_query={q}"
-            return await m.reply(
-                "Saya bisa cariin via tombol ini.\n"
-                "Kalau mau hasil list rapi + bisa auto-play, set `YOUTUBE_API_KEY`.\n",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open Search", url=url)]]),
-            )
-
-        msg = await m.reply("🔎 Cari di YouTube (API resmi)...")
-        try:
-            results = await yt_search(query, limit=5)
-        except Exception as e:
-            return await msg.edit(f"❌ Gagal search YouTube API.\n`{e}`")
-
-        if not results:
-            return await msg.edit("❌ Tidak ada hasil.")
-
-        # Tampilkan list + tombol open (biar user bisa copy link /play link)
-        text = "✅ Hasil YouTube (pilih/open link):\n" + "\n".join(
-            [f"{i}. {t[0]}" for i, t in enumerate(results, 1)]
-        ) + "\n\nKirim linknya ke `/play <link>` buat langsung play."
-        return await msg.edit(text, reply_markup=yt_kb(results))
-
-    # 4) URL non-stream (misal website biasa)
-    return await m.reply(
-        "URL itu bukan stream yang bisa diputar langsung.\n"
-        "Untuk VC: kirim link **m3u8/mp3/radio stream**, atau link YouTube.",
-        quote=True,
-    )
-
+        player.playing_task = asyncio.create_task(_runner())
 
 # =========================
 # Commands
 # =========================
 @bot.on_message(filters.command(["start", "help"]))
-async def help_cmd(_, m: Message):
-    txt = (
-        "🎵 **MusicBot (versi stabil)**\n\n"
-        "**Commands**\n"
-        "/play <m3u8/mp3/url|judul|link yt>\n"
-        "/cplay [@channel|-100id] <m3u8/mp3/url|judul|link yt>\n"
-        "/pause, /resume, /skip, /stop, /queue\n\n"
-        "Catatan:\n"
-        "- Playback VC butuh **VC aktif**.\n"
-        "- Keyword YouTube butuh `YOUTUBE_API_KEY`.\n"
-        "- Link YouTube bisa langsung `/play <link>`."
+async def cmd_start(_, m: Message):
+    await m.reply(
+        "Music Bot v2 siap gas.\n\n"
+        "Commands:\n"
+        "/play <judul/link>\n"
+        "/pause | /resume\n"
+        "/skip | /stop\n"
+        "/queue | /now\n"
+        "/join | /leave\n"
     )
-    await m.reply(txt)
 
-
-@bot.on_message(filters.command(["play"]))
-async def play_cmd(_, m: Message):
-    # allow in groups/supergroups
-    query = " ".join(m.command[1:]).strip() if m.command else ""
-    await handle_play(m, m.chat.id, query)
-
-
-@bot.on_message(filters.command(["cplay"]))
-async def cplay_cmd(_, m: Message):
-    target_token, query = parse_c_command(m)
+@bot.on_message(filters.command("join"))
+async def cmd_join(_, m: Message):
+    if not is_allowed(m):
+        return await m.reply("Akses ditolak. Ini mode owner-only.")
     try:
-        target_chat_id = await resolve_target_chat_id(m, target_token)
+        await join_vc(m.chat.id)
+        await m.reply("OK, assistant join VC.")
     except Exception as e:
-        return await m.reply(f"❌ Target tidak valid.\n`{e}`")
-    await handle_play(m, target_chat_id, query)
+        await m.reply(f"Gagal join: {e}")
 
+@bot.on_message(filters.command("leave"))
+async def cmd_leave(_, m: Message):
+    if not is_allowed(m):
+        return await m.reply("Akses ditolak. Ini mode owner-only.")
+    await leave_vc(m.chat.id)
+    await m.reply("Keluar dari VC.")
 
-@bot.on_message(filters.command(["pause"]))
-async def pause_cmd(_, m: Message):
-    s = st(m.chat.id)
-    if not s.playing:
-        return await m.reply("Belum ada yang diputar.")
+@bot.on_message(filters.command("play"))
+async def cmd_play(_, m: Message):
+    if not is_allowed(m):
+        return await m.reply("Akses ditolak. Ini mode owner-only.")
+    if len(m.command) < 2:
+        return await m.reply("Pakai: /play <judul atau link youtube>")
+    query = m.text.split(None, 1)[1].strip()
+
+    msg = await m.reply("Download dulu ya, jangan panik...")
     try:
-        await call.pause_stream(m.chat.id)
-        s.paused = True
-        await m.reply("⏸ Paused.", reply_markup=player_kb(m.chat.id))
+        track = await ytdlp_download_audio(query, m.chat.id)
     except Exception as e:
-        await m.reply(f"❌ Gagal pause.\n`{e}`")
+        return await msg.edit(f"Download gagal: {e}")
 
+    player = get_player(m.chat.id)
+    async with player.lock:
+        player.queue.append(track)
+        qpos = len(player.queue)
 
-@bot.on_message(filters.command(["resume"]))
-async def resume_cmd(_, m: Message):
-    s = st(m.chat.id)
-    if not s.playing:
-        return await m.reply("Belum ada yang diputar.")
+    await msg.edit(f"Masuk antrian #{qpos}: **{track.title}**")
+    await play_loop(m.chat.id)
+
+@bot.on_message(filters.command("pause"))
+async def cmd_pause(_, m: Message):
+    if not is_allowed(m):
+        return await m.reply("Akses ditolak. Ini mode owner-only.")
     try:
-        await call.resume_stream(m.chat.id)
-        s.paused = False
-        await m.reply("▶️ Resumed.", reply_markup=player_kb(m.chat.id))
+        await calls.pause_stream(m.chat.id)
+        await m.reply("Paused.")
     except Exception as e:
-        await m.reply(f"❌ Gagal resume.\n`{e}`")
+        await m.reply(f"Gagal pause: {e}")
 
-
-@bot.on_message(filters.command(["skip"]))
-async def skip_cmd(_, m: Message):
-    s = st(m.chat.id)
-    if not s.playing:
-        return await m.reply("Belum ada yang diputar.")
-    await m.reply("⏭ Skipping...")
+@bot.on_message(filters.command("resume"))
+async def cmd_resume(_, m: Message):
+    if not is_allowed(m):
+        return await m.reply("Akses ditolak. Ini mode owner-only.")
     try:
-        await play_next(m.chat.id, m.chat.id)
+        await calls.resume_stream(m.chat.id)
+        await m.reply("Resumed.")
     except Exception as e:
-        await m.reply(f"❌ Gagal skip.\n`{e}`")
+        await m.reply(f"Gagal resume: {e}")
 
+@bot.on_message(filters.command("skip"))
+async def cmd_skip(_, m: Message):
+    if not is_allowed(m):
+        return await m.reply("Akses ditolak. Ini mode owner-only.")
+    player = get_player(m.chat.id)
+    async with player.lock:
+        if not player.queue:
+            player.now_playing = None
+            await leave_vc(m.chat.id)
+            return await m.reply("Queue kosong. Keluar VC.")
+        # set now_playing beda supaya loop lanjut
+        player.now_playing = None
+    await m.reply("Skipped. Lanjut lagu berikutnya.")
+    await play_loop(m.chat.id)
 
-@bot.on_message(filters.command(["stop"]))
-async def stop_cmd(_, m: Message):
-    s = st(m.chat.id)
-    s.queue.clear()
-    s.playing = None
-    s.paused = False
-    try:
-        await call.leave_group_call(m.chat.id)
-    except Exception:
-        pass
-    await m.reply("⏹ Stop. Keluar dari VC.")
+@bot.on_message(filters.command("stop"))
+async def cmd_stop(_, m: Message):
+    if not is_allowed(m):
+        return await m.reply("Akses ditolak. Ini mode owner-only.")
+    player = get_player(m.chat.id)
+    async with player.lock:
+        player.queue.clear()
+        player.now_playing = None
+    await leave_vc(m.chat.id)
+    await m.reply("Stopped. Queue dibersihin, keluar VC.")
 
+@bot.on_message(filters.command("queue"))
+async def cmd_queue(_, m: Message):
+    player = get_player(m.chat.id)
+    async with player.lock:
+        if not player.queue:
+            return await m.reply("Queue kosong.")
+        txt = "\n".join([f"{i+1}. {t.title}" for i, t in enumerate(player.queue[:20])])
+    await m.reply(f"Queue (top 20):\n{txt}")
 
-@bot.on_message(filters.command(["queue"]))
-async def queue_cmd(_, m: Message):
-    s = st(m.chat.id)
-    if not s.playing and not s.queue:
-        return await m.reply("Queue kosong.")
-    lines = []
-    if s.playing:
-        lines.append(f"🎶 Now: **{s.playing.title}**")
-    if s.queue:
-        lines.append("\n📜 Next:")
-        for i, t in enumerate(s.queue[:15], 1):
-            lines.append(f"{i}. {t.title}")
-        if len(s.queue) > 15:
-            lines.append(f"...dan `{len(s.queue)-15}` lagi.")
-    await m.reply("\n".join(lines), reply_markup=player_kb(m.chat.id))
+@bot.on_message(filters.command("now"))
+async def cmd_now(_, m: Message):
+    player = get_player(m.chat.id)
+    async with player.lock:
+        if not player.now_playing:
+            return await m.reply("Lagi gak muter apa-apa.")
+        t = player.now_playing
+    await m.reply(f"Now Playing: **{t.title}**")
 
-
-@bot.on_callback_query()
-async def callbacks(_, q: CallbackQuery):
-    try:
-        _, action, chat_id_str = q.data.split(":")
-        chat_id = int(chat_id_str)
-    except Exception:
-        return await q.answer("Invalid button.", show_alert=True)
-
-    s = st(chat_id)
-
-    if action == "pause":
-        if not s.playing:
-            return await q.answer("Belum ada playback.", show_alert=True)
-        try:
-            if s.paused:
-                await call.resume_stream(chat_id)
-                s.paused = False
-                await q.answer("Resumed")
-            else:
-                await call.pause_stream(chat_id)
-                s.paused = True
-                await q.answer("Paused")
-            await q.message.edit_reply_markup(player_kb(chat_id))
-        except Exception as e:
-            await q.answer(f"Gagal: {e}", show_alert=True)
-
-    elif action == "skip":
-        if not s.playing:
-            return await q.answer("Belum ada playback.", show_alert=True)
-        await q.answer("Skipping...")
-        try:
-            await play_next(chat_id, q.message.chat.id)
-        except Exception as e:
-            await bot.send_message(q.message.chat.id, f"❌ Gagal skip.\n`{e}`")
-
-    elif action == "stop":
-        s.queue.clear()
-        s.playing = None
-        s.paused = False
-        try:
-            await call.leave_group_call(chat_id)
-        except Exception:
-            pass
-        await q.answer("Stopped")
-        try:
-            await q.message.edit_text("⏹ Stop. Keluar dari VC.")
-        except Exception:
-            pass
-
-    elif action == "queue":
-        await q.answer("Queue")
-        if not s.playing and not s.queue:
-            return await bot.send_message(q.message.chat.id, "Queue kosong.")
-        lines = []
-        if s.playing:
-            lines.append(f"🎶 Now: **{s.playing.title}**")
-        if s.queue:
-            lines.append("\n📜 Next:")
-            for i, t in enumerate(s.queue[:15], 1):
-                lines.append(f"{i}. {t.title}")
-            if len(s.queue) > 15:
-                lines.append(f"...dan `{len(s.queue)-15}` lagi.")
-        await bot.send_message(q.message.chat.id, "\n".join(lines))
-    else:
-        await q.answer("Unknown action.", show_alert=True)
-
-
+# =========================
+# Main
+# =========================
 async def main():
-    await assistant.start()
-    await bot.start()
-    await call.start()
-    print("MusicBot running...")
-    await asyncio.Event().wait()
+    ensure_tools()
 
+    # Buat file silent dummy kalau join butuh stream awal
+    silent = "silence.mp3"
+    if not os.path.exists(silent):
+        # generate 1 detik silent mp3
+        subprocess.run(
+            [FFMPEG_BIN, "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "1", "-q:a", "9", "-acodec", "libmp3lame", silent],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+    await assistant.start()
+    await calls.start()
+    await bot.start()
+    print("Music Bot v2: ON")
+
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())

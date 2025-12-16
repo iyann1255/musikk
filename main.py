@@ -165,7 +165,7 @@ async def ensure_join_and_play(chat_id: int, announce_chat_id: int):
 
     try:
         # py-tgcalls 2.2.8: pass AudioPiped directly (no InputStream wrapper)
-        await call.join_group_call(chat_id, AudioPiped(nxt.source))
+        await call.join_group_call(chat_id, stream=AudioPiped(nxt.source))
 
         await bot.send_message(
             announce_chat_id,
